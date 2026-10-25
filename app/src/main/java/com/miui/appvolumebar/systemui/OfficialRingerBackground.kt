@@ -323,6 +323,18 @@ internal object OfficialRingerBackground {
         utilClass: Class<*>
     ): Boolean {
         invoke(utilClass, receiverOf(utilClass), "setRoundRect", view, radius)
+        // 优先两参签名：HyperLight 只 hook 了 (View, ColorBlendToken) 这一个重载，
+        // 走三参版本不会被它认领，克隆按钮就留不下同款玻璃。
+        if (invoke(
+                utilClass,
+                receiverOf(utilClass),
+                "setMiViewBlurAndBlendColor",
+                view,
+                blendToken
+            ).success
+        ) {
+            return true
+        }
         return invoke(
             utilClass,
             receiverOf(utilClass),

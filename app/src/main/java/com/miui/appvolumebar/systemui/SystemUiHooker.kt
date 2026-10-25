@@ -18,6 +18,7 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage
 import com.miui.appvolumebar.status.HookTracker
 import java.lang.ref.WeakReference
 import java.lang.reflect.Field
+import java.lang.reflect.Method
 
 /**
  * SystemUI 注入与音量条生命周期管理。
@@ -55,6 +56,23 @@ object SystemUiHooker {
     @Volatile private var slideScale = 1f
     private val mainHandler = Handler(Looper.getMainLooper())
 
+    /**
+     * 热路径保护壳：这些回调每帧都会跑，一旦抛未捕获异常就是 SystemUI 崩溃循环。
+     * 失败只记一次日志并停止该路径后续报错，绝不让异常冒泡回宿主。
+     */
+    @Volatile private var hotPathFailureLogged = false
+
+    private inline fun safeHotPath(tag: String, block: () -> Unit) {
+        try {
+            block()
+        } catch (t: Throwable) {
+            if (!hotPathFailureLogged) {
+                hotPathFailureLogged = true
+                MainHook.log("$tag failed in hot path (further errors silenced)", t)
+            }
+        }
+    }
+
     // 官方 VolumeShowHideAnimator 的运行状态跟踪，用于：
     // show/hide 动画进行中冻结本模块对 footer 布局的改动（可见性变更会让入场动画中途重排）
     private var cachedAnimatorRef: WeakReference<Any>? = null
@@ -62,6 +80,17 @@ object SystemUiHooker {
     @Volatile private var isAnimatingShow = false
     private val dndHistory = DndMotionHistory()
     private const val STAGGER_DELAY_MS = 20L
+
+    /** 官方 animator 每帧会同时触发 setViewX 和 listener.onUpdate，同一帧只跑一遍完整同步。 */
+    private const val FRAME_MS = 16L
+    private var lastSyncFrame = -1L
+
+    /** bg_blur 子视图缓存：findViewById 会递归整棵子树，每帧两次太浪费。 */
+    private val blurViewCache = java.util.WeakHashMap<View, View>()
+
+    /** MiuiVolumeDialogView#isExpanded 反射句柄，避免每次重新扫方法表。 */
+    @Volatile private var isExpandedMethod: Method? = null
+    @Volatile private var isExpandedMethodOwner: Class<*>? = null
     @Volatile private var visibilityUpdateDeferred = false
     private var deferredVisibilityRetries = 0
 
@@ -648,7 +677,7 @@ object SystemUiHooker {
             XposedBridge.hookAllMethods(animatorClass, "setViewX", object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
                     val animator = param.thisObject ?: return
-                    syncEntryTransformations(animator)
+                    safeHotPath("setViewX") { syncEntryTransformations(animator) }
                 }
             })
             XposedBridge.hookAllMethods(animatorClass, "show", object : XC_MethodHook() {
@@ -804,7 +833,7 @@ object SystemUiHooker {
         try {
             XposedBridge.hookAllMethods(clazz, "onUpdate", object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
-                    cachedAnimatorRef?.get()?.let { syncEntryTransformations(it) }
+                    cachedAnimatorRef?.get()?.let { anim -> safeHotPath("onUpdate") { syncEntryTransformations(anim) } }
                 }
             })
             MainHook.log("Hooked VolumeShowHideAnimator.listener.onUpdate successfully (${clazz.name})")
@@ -822,6 +851,11 @@ object SystemUiHooker {
      * 5. 毛玻璃层（bg_blur）：同步前景 scale。
      */
     private fun syncEntryTransformations(animator: Any) {
+        // 官方 animator 每帧会同时回调 setViewX 与 listener.onUpdate，同一帧只处理第一次
+        val frame = android.os.SystemClock.uptimeMillis() / FRAME_MS
+        if (frame == lastSyncFrame) return
+        lastSyncFrame = frame
+
         val entry = getEntryView(animator) ?: return
         if (entry.visibility != View.VISIBLE) return
         val dnd = getDndView(animator) ?: return
@@ -831,8 +865,8 @@ object SystemUiHooker {
         val scale = dnd.scaleX
         entry.scaleX = scale
         entry.scaleY = scale
-        val dndBlur = blurViewOf(dnd)
-        val entryBlur = blurViewOf(entry)
+        val dndBlur = cachedBlurViewOf(dnd)
+        val entryBlur = cachedBlurViewOf(entry)
         if (dndBlur != null && entryBlur != null) {
             entryBlur.scaleX = dndBlur.scaleX
             entryBlur.scaleY = dndBlur.scaleY
@@ -895,14 +929,14 @@ object SystemUiHooker {
                 override fun afterHookedMethod(param: MethodHookParam) {
                     val value = (param.args.getOrNull(1) as? Number)?.toFloat() ?: return
                     slideDndY = value
-                    applyEntrySlideTranslation()
+                    safeHotPath("setDndY") { applyEntrySlideTranslation() }
                 }
             })
             val scaleHooks = XposedBridge.hookAllMethods(clazz, "setScale", object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
                     val value = (param.args.getOrNull(1) as? Number)?.toFloat() ?: return
                     slideScale = value
-                    applyEntrySlideScale(value)
+                    safeHotPath("setScale") { applyEntrySlideScale(value) }
                 }
             })
             XposedBridge.hookAllMethods(clazz, "resetView", object : XC_MethodHook() {
@@ -942,7 +976,7 @@ object SystemUiHooker {
     private fun applyEntrySlideScale(scale: Float) {
         val entry = cachedEntryView?.get() ?: return
         if (entry.visibility != View.VISIBLE) return
-        val blur = blurViewOf(entry)
+        val blur = cachedBlurViewOf(entry)
         if (blur != null) {
             blur.scaleX = scale
             blur.scaleY = scale
@@ -977,6 +1011,14 @@ object SystemUiHooker {
 
     private var cachedBlurViewId = 0
 
+    /** 热路径版本：命中缓存就跳过 findViewById 的子树遍历。 */
+    private fun cachedBlurViewOf(host: View): View? {
+        blurViewCache[host]?.let { return it }
+        val blur = blurViewOf(host) ?: return null
+        blurViewCache[host] = blur
+        return blur
+    }
+
     private fun blurViewOf(button: View): View? {
         if (cachedBlurViewId == 0) {
             for (pkg in listOf(button.context.packageName, TARGET_PLUGIN_PACKAGE, MainHook.PKG_PLUGIN).distinct()) {
@@ -994,9 +1036,7 @@ object SystemUiHooker {
         if (!visibilityUpdateDeferred) return
         visibilityUpdateDeferred = false
         deferredVisibilityRetries = 0
-        mainHandler.post {
-            updateVisibility()
-        }
+        mainHandler.post { safeHotPath("flushDeferredVisibility") { updateVisibility() } }
     }
 
     private fun getFieldAny(clazz: Class<*>, vararg names: String): Field? {
@@ -1013,9 +1053,7 @@ object SystemUiHooker {
     }
 
     private fun scheduleInsertion(view: View, trigger: String) {
-        mainHandler.post {
-            tryInsertEntry(view, trigger)
-        }
+        mainHandler.post { safeHotPath("insertEntry") { tryInsertEntry(view, trigger) } }
     }
 
     private fun tryInsertEntry(targetView: View, trigger: String) {
@@ -1296,7 +1334,7 @@ object SystemUiHooker {
         if (Looper.myLooper() == Looper.getMainLooper()) {
             doVolumePreShowH()
         } else {
-            mainHandler.post { doVolumePreShowH() }
+            mainHandler.post { safeHotPath("volumePreShow") { doVolumePreShowH() } }
         }
     }
 
@@ -1339,7 +1377,7 @@ object SystemUiHooker {
         if (Looper.myLooper() == Looper.getMainLooper()) {
             doAnimHideComplete()
         } else {
-            mainHandler.post { doAnimHideComplete() }
+            mainHandler.post { safeHotPath("animHideComplete") { doAnimHideComplete() } }
         }
     }
 
@@ -1371,6 +1409,7 @@ object SystemUiHooker {
         if (visibilityUpdateDeferred) return
         visibilityUpdateDeferred = true
         mainHandler.postDelayed({
+            safeHotPath("deferredVisibility") {
             visibilityUpdateDeferred = false
             if (isShowHideAnimRunning() && deferredVisibilityRetries < VISIBILITY_MAX_RETRIES) {
                 deferredVisibilityRetries++
@@ -1378,6 +1417,7 @@ object SystemUiHooker {
             } else {
                 deferredVisibilityRetries = 0
                 updateVisibility()
+            }
             }
         }, VISIBILITY_RETRY_DELAY_MS)
     }
@@ -1405,7 +1445,12 @@ object SystemUiHooker {
         while (p != null) {
             if (p.javaClass.name.contains("MiuiVolumeDialogView")) {
                 try {
-                    val isExp = p.javaClass.getMethod("isExpanded").invoke(p) as? Boolean
+                    val method = isExpandedMethod?.takeIf { isExpandedMethodOwner == p.javaClass }
+                        ?: p.javaClass.getMethod("isExpanded").also {
+                            isExpandedMethod = it
+                            isExpandedMethodOwner = p.javaClass
+                        }
+                    val isExp = method.invoke(p) as? Boolean
                     if (isExp != null) {
                         realExpanded = isExp
                         isExpanded = isExp
@@ -1472,8 +1517,8 @@ object SystemUiHooker {
                 object : android.media.AudioManager.AudioPlaybackCallback() {
                     override fun onPlaybackConfigChanged(configs: MutableList<android.media.AudioPlaybackConfiguration>) {
                         mainHandler.post {
-                            if (cachedEntryView?.get() != null) {
-                                updateVisibility()
+                            safeHotPath("playbackCallback") {
+                                if (cachedEntryView?.get() != null) updateVisibility()
                             }
                         }
                     }

@@ -33,8 +33,16 @@ object VolumeEntryLayout {
     private const val DEFAULT_ICON_SIZE_DP = 22
     private const val DEFAULT_GAP_DP = 4
 
+    /** attach 后重放官方 updateState 的最大重试帧数（等布局拿到真实高度）。 */
+    private const val MATERIAL_REPLAY_MAX = 3
+
     // 保留官方 RingerButtonHelper 实例，使 updateExpandedH() 也能驱动复制按钮。
     private val officialHelpers = WeakHashMap<View, Any>()
+
+    // updateState 重放只做一次：HyperLight 会 hook Util.setMiViewBlurAndBlendColor，
+    // 每次重放都会让它再 applyViewMaterial 一遍并注册一个配置跟踪器，反复重放会堆积。
+    private val materialReplayed =
+        java.util.Collections.newSetFromMap(java.util.WeakHashMap<View, Boolean>())
 
     /**
      * 创建与官方静音/勿扰样式一致的圆形入口按钮
@@ -57,6 +65,8 @@ object VolumeEntryLayout {
                     onDismissRequest
                 )
             ) {
+                VolumeNudgeEffect.attach(officialButton)
+                refreshOfficialMaterialOnAttach(officialButton)
                 return officialButton
             }
         }
@@ -135,6 +145,7 @@ object VolumeEntryLayout {
         chromeView.isFocusable = true
         chromeView.setOnClickListener(clickListener)
         rootLayout.setOnClickListener(clickListener)
+        VolumeNudgeEffect.attach(rootLayout)
 
         return rootLayout
     }
@@ -267,8 +278,45 @@ object VolumeEntryLayout {
         return null
     }
 
-    fun updateExpanded(root: View, expanded: Boolean) {
-        val helper = officialHelpers[root] ?: return
+    /**
+     * 尺寸就绪后重放一次官方 updateState()。
+     *
+     * 两个原因：
+     * 1. 官方材质（Util.setMiViewBlurAndBlendColor）用 view.getHeight()/2 算圆角，
+     *    绑定时还没布局 → 高度为 0 → 材质挂不上；
+     * 2. HyperLight 的柔光玻璃是在 setMiViewBlurAndBlendColor / updateState 的
+     *    调用栈里认领 view 的，只有复现这条栈，克隆按钮才会被套上同款玻璃。
+     */
+    private fun refreshOfficialMaterialOnAttach(root: View) {
+        root.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
+            override fun onViewAttachedToWindow(v: View) {
+                replayUpdateState(v, 0)
+            }
+
+            override fun onViewDetachedFromWindow(v: View) {}
+        })
+    }
+
+    /**
+     * attach 之后重放 updateState；若此时还没布局（height 仍为 0）就顺延一帧再试，
+     * 否则圆角会被算成 0、材质挂不上。
+     */
+    private fun replayUpdateState(root: View, attempt: Int) {
+        root.post {
+            if (root.height <= 0 && attempt < MATERIAL_REPLAY_MAX) {
+                replayUpdateState(root, attempt + 1)
+                return@post
+            }
+            if (!materialReplayed.add(root)) return@post
+            val helper = officialHelpers[root] ?: return@post
+            runCatching {
+                helper.javaClass.getDeclaredMethod("updateState").apply { isAccessible = true }
+                    .invoke(helper)
+            }.onFailure { MainHook.log("Could not replay updateState after attach", it) }
+        }
+    }
+
+    fun updateExpanded(root: View, expanded: Boolean) {        val helper = officialHelpers[root] ?: return
         try {
             val method = helper.javaClass.getDeclaredMethod("onExpanded", Boolean::class.javaPrimitiveType, Boolean::class.javaPrimitiveType)
                 .apply { isAccessible = true }

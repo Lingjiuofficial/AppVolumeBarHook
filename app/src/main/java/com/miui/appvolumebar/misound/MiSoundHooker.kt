@@ -55,6 +55,30 @@ object MiSoundHooker {
 
     val tracker = HookTracker(MainHook.PKG_MISOUND)
 
+    // ---- 背景模糊参数：dp 换算成 px，按屏幕密度自适应 ----
+    /** 窗口级 blur 半径。只是给 BackgroundBlurDrawable 提供采样能力，越小桌面越清晰。 */
+    private const val BLUR_BEHIND_DP = 24f
+
+    /** 卡片自身叠加的模糊半径，做出磨砂质感。 */
+    private const val CARD_BLUR_DP = 48f
+
+    /** ViewRootImpl 就绪存在时序差，attach 早期拿不到时补几次。 */
+    private const val BLUR_RETRY_MAX = 3
+    private const val BLUR_RETRY_DELAY_MS = 80L
+
+    private fun blurBehindRadiusPx(context: Context): Int =
+        (BLUR_BEHIND_DP * context.resources.displayMetrics.density).toInt()
+
+    private fun cardBlurRadiusPx(context: Context): Int =
+        (CARD_BLUR_DP * context.resources.displayMetrics.density).toInt()
+
+    /** View#getViewRootImpl 反射句柄，缓存一次（attach 阶段会被多次调用）。 */
+    private val viewRootImplOf: Method? by lazy {
+        runCatching {
+            View::class.java.getDeclaredMethod("getViewRootImpl").apply { isAccessible = true }
+        }.getOrNull()
+    }
+
     private var capturedFab: WeakReference<View>? = null
     private var cachedContext: WeakReference<Context>? = null
     private var cachedControllerInstance: WeakReference<Any>? = null
@@ -105,15 +129,21 @@ object MiSoundHooker {
                         }
 
                         if (isMediaVolumePageView(view)) {
-                            MainHook.log("Intercepted MediaVolumePageView addView, disabling full-screen window blur/dim")
-                            // 移除全屏窗口背景高斯模糊与全屏暗化，使得桌面壁纸与应用图标保持清晰锐利
-                            params.flags = params.flags and WindowManager.LayoutParams.FLAG_BLUR_BEHIND.inv()
-                            params.flags = params.flags and WindowManager.LayoutParams.FLAG_DIM_BEHIND.inv()
-                            params.dimAmount = 0.0f
+                            MainHook.log("Intercepted MediaVolumePageView addView: keep blur capability, drop dim only")
                             try {
+                                // 只关掉全屏暗化，保留窗口 blur 能力。
+                                // BackgroundBlurDrawable 的模糊采样完全依赖窗口的 blurBehindRadius > 0，
+                                // 之前把半径归零等于抽掉了模糊数据源，卡片只能退化成纯色块
+                                // —— 这就是"多音量界面没有玻璃"的根因。
+                                params.flags = params.flags and WindowManager.LayoutParams.FLAG_DIM_BEHIND.inv()
+                                params.dimAmount = 0.0f
+                                params.flags = params.flags or WindowManager.LayoutParams.FLAG_BLUR_BEHIND
                                 params.javaClass.getMethod("setBlurBehindRadius", Int::class.javaPrimitiveType)
-                                    .invoke(params, 0)
-                            } catch (_: Throwable) {}
+                                    .invoke(params, blurBehindRadiusPx(view.context))
+                            } catch (t: Throwable) {
+                                // 改窗口参数失败绝不能让 misound 崩掉，保持原样即可
+                                MainHook.log("Failed to tune volume panel window blur", t)
+                            }
                         }
                     }
                 })
@@ -723,6 +753,75 @@ object MiSoundHooker {
      * - 音量柱高度占屏幕高度的 22.1%（约 180~190dp，较原版 225dp 缩短，更加精致和谐）；
      * - 清除原版布局中多余的 15dip 底部内边距，确保上下边距完全一致对称。
      */
+    /**
+     * 给音量柱挂 HyperLight 同款按压反馈：按下时整张卡片缩到 0.92（300ms），抬起回弹。
+     *
+     * 刻意不做 HyperLight 的横向 nudge：多应用时这一列在 ViewPager2 里，
+     * 横移会跟左右翻页手势打架。缩放才是苹果式按压的核心观感。
+     */
+    private fun attachPressEffect(slider: View) {
+        if (slider.getTag(TAG_PRESS_ATTACHED) != null) return
+        try {
+            slider.setTag(TAG_PRESS_ATTACHED, true)
+            val card = findCardOf(slider) ?: return
+            // SeekBar 的拖动走自己的 onTouchEvent，这里链式保留已有监听器，绝不吞事件
+            val previous = previousTouchListenerOf(slider)
+            slider.setOnTouchListener { v, event ->
+                try {
+                    when (event.actionMasked) {
+                        MotionEvent.ACTION_DOWN -> scaleCard(card, PRESS_SCALE)
+                        MotionEvent.ACTION_UP,
+                        MotionEvent.ACTION_CANCEL -> scaleCard(card, 1f)
+                    }
+                } catch (_: Throwable) {
+                    // 触摸回调抛异常会直接崩掉 misound
+                }
+                previous?.onTouch(v, event) ?: false
+            }
+        } catch (_: Throwable) {
+            // 挂不上就退化成无按压反馈，不影响滑动
+        }
+    }
+
+    private fun scaleCard(card: View, value: Float) {
+        try {
+            card.animate().cancel()
+            card.animate()
+                .scaleX(value)
+                .scaleY(value)
+                .setDuration(PRESS_DURATION_MS)
+                .setInterpolator(DecelerateInterpolator())
+                .start()
+        } catch (_: Throwable) {
+        }
+    }
+
+    /** 顺着 parent 找到被打上 TAG_CARD_INITIALIZED 的卡片容器。 */
+    private fun findCardOf(view: View): View? {
+        var p: android.view.ViewParent? = view.parent
+        while (p is View) {
+            if (p.getTag(TAG_CARD_INITIALIZED) != null) return p
+            p = p.parent
+        }
+        return null
+    }
+
+    /** 反射读取已有的 OnTouchListener（Android 没有公开 getter）。 */
+    private fun previousTouchListenerOf(view: View): View.OnTouchListener? = try {
+        val info = View::class.java.getDeclaredField("mListenerInfo")
+            .apply { isAccessible = true }
+            .get(view)
+        if (info == null) {
+            null
+        } else {
+            info.javaClass.getDeclaredField("mOnTouchListener")
+                .apply { isAccessible = true }
+                .get(info) as? View.OnTouchListener
+        }
+    } catch (_: Throwable) {
+        null
+    }
+
     private fun applySliderDimensions(lVar: Any) {
         try {
             val seekBar = findSeekBar(lVar) ?: return
@@ -761,6 +860,7 @@ object MiSoundHooker {
                     rootCol.layoutParams = rlp
                 }
             }
+            attachPressEffect(seekBar)
         } catch (t: Throwable) {
             MainHook.log("Failed to apply slider dimensions", t)
         }
@@ -816,6 +916,7 @@ object MiSoundHooker {
                     }
                 }
             }
+            attachPressEffect(view)
             return
         }
 
@@ -851,11 +952,13 @@ object MiSoundHooker {
         return maxOf(dm.widthPixels, dm.heightPixels)
     }
 
-    private fun sliderWidthPx(context: Context): Int = (referenceWidthPx(context) * 0.158f).toInt()
+    private fun sliderWidthPx(context: Context): Int =
+        (SLIDER_WIDTH_DP * context.resources.displayMetrics.density).toInt()
 
     private fun sliderHeightPx(context: Context): Int = (referenceHeightPx(context) * 0.221f).toInt()
 
-    private fun columnGapPx(context: Context): Int = (referenceWidthPx(context) * 0.038f).toInt()
+    private fun columnGapPx(context: Context): Int =
+        (SLIDER_GAP_DP * context.resources.displayMetrics.density).toInt()
 
     /**
      * 更新多页面指示器小圆点的样式与高亮：
@@ -938,14 +1041,11 @@ object MiSoundHooker {
         }
     }
 
-    private fun applyBackdropBlur(view: View, cornerRadius: Float, isNight: Boolean) {
+    private fun applyBackdropBlur(view: View, cornerRadius: Float, isNight: Boolean, attempt: Int = 0) {
         var applied = false
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             try {
-                val getViewRootImplMethod = View::class.java.getDeclaredMethod("getViewRootImpl").apply {
-                    isAccessible = true
-                }
-                val viewRootImpl = getViewRootImplMethod.invoke(view)
+                val viewRootImpl = viewRootImplOf?.invoke(view)
                 if (viewRootImpl != null) {
                     val createBlurMethod = viewRootImpl.javaClass.getMethod("createBackgroundBlurDrawable")
                     val blurDrawable = createBlurMethod.invoke(viewRootImpl) as? Drawable
@@ -953,8 +1053,9 @@ object MiSoundHooker {
                         val clsInt = Int::class.javaPrimitiveType
                         val clsFloat = Float::class.javaPrimitiveType
 
-                        // setBlurRadius(100)
-                        blurDrawable.javaClass.getMethod("setBlurRadius", clsInt).invoke(blurDrawable, 100)
+                        // 窗口 blur 只提供采样源，卡片在此基础上再叠加一层大半径模糊
+                        blurDrawable.javaClass.getMethod("setBlurRadius", clsInt)
+                            .invoke(blurDrawable, cardBlurRadiusPx(view.context))
 
                         // setCornerRadius(r, r, r, r) or setCornerRadius(r)
                         try {
@@ -966,11 +1067,11 @@ object MiSoundHooker {
                                 .invoke(blurDrawable, cornerRadius)
                         }
 
-                        // 卡片毛玻璃底色
+                        // 卡片柔光底色：不透明度压低，让底层模糊透出来（HyperLight 观感）
                         val cardBgColor = if (isNight) {
-                            Color.parseColor("#801E1E22")
+                            Color.parseColor("#661E1E22")
                         } else {
-                            Color.parseColor("#77626262")
+                            Color.parseColor("#59FFFFFF")
                         }
                         blurDrawable.javaClass.getMethod("setColor", clsInt).invoke(blurDrawable, cardBgColor)
 
@@ -983,6 +1084,14 @@ object MiSoundHooker {
             } catch (t: Throwable) {
                 MainHook.log("Hardware BackgroundBlurDrawable reflection failed, using frosted fallback", t)
             }
+        }
+
+        // ViewRootImpl/窗口 blur 就绪存在时序差：attach 早期拿不到时补几次，避免永久退化
+        if (!applied && attempt < BLUR_RETRY_MAX) {
+            view.postDelayed({
+                if (view.isAttachedToWindow) applyBackdropBlur(view, cornerRadius, isNight, attempt + 1)
+            }, BLUR_RETRY_DELAY_MS)
+            return
         }
 
         if (!applied) {
@@ -1664,4 +1773,14 @@ object MiSoundHooker {
     private const val STATUS_EXPANDED = 5000
     private const val STATUS_CLOSING = 301
     private const val TAG_CARD_INITIALIZED = 0x7f0a9999
+    private const val TAG_PRESS_ATTACHED = 0x7f0a9998
+
+    // ---- 观感对齐 HyperLight 细音量条（方案 B：适度收细，保留胶囊与触摸面积）----
+    /** 音量柱宽度。原来是屏幕短边的 15.8%（约 70dp），这里收到 44dp。 */
+    private const val SLIDER_WIDTH_DP = 44f
+    /** 音量柱间距。原来是短边 3.8%（约 17dp），随柱子收窄一起收。 */
+    private const val SLIDER_GAP_DP = 12f
+    /** 按压缩放比例与时长，与 HyperLight 在音量条上的 0.92f / 300ms 一致。 */
+    private const val PRESS_SCALE = 0.92f
+    private const val PRESS_DURATION_MS = 300L
 }
