@@ -1412,7 +1412,6 @@ object SystemUiHooker {
         val divider = cachedDividerView?.get()
         divider?.visibility = View.GONE
         entry.visibility = View.GONE
-        hideAppVolumePanel()
         entry.translationX = 0f
         entry.translationY = 0f
         entry.scaleX = 1f
