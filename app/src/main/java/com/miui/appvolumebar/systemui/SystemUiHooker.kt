@@ -92,23 +92,8 @@ object SystemUiHooker {
     @Volatile private var isExpandedMethod: Method? = null
     @Volatile private var isExpandedMethodOwner: Class<*>? = null
 
-    /** 原生音量面板（MiuiVolumeDialogView），独立应用音量柱以它为锚点定位。 */
-    private var volumeDialogViewRef: WeakReference<View>? = null
-
-    /** 展开态挂上贴在面板左边的独立音量柱；View 在 SystemUI 进程，材质由 HyperLight 接管。 */
-    private fun showSideColumn() {
-        try {
-            val anchor = volumeDialogViewRef?.get() ?: return
-            val cl = pluginClassLoader ?: return
-            SideAppVolumeColumn.attach(anchor, cl)
-        } catch (t: Throwable) {
-            MainHook.log("showSideColumn failed", t)
-        }
-    }
-
-    private fun hideSideColumn() {
-        runCatching { volumeDialogViewRef?.get()?.let { SideAppVolumeColumn.detach(it) } }
-    }
+    // 应用音量柱走 NativeAppVolumeColumn：直接 inflate 官方柱子布局塞进 VolumeColumns 容器，
+    // 布局/展开收起/宽度全部由官方容器管。
     @Volatile private var visibilityUpdateDeferred = false
     private var deferredVisibilityRetries = 0
 
@@ -668,8 +653,31 @@ object SystemUiHooker {
                             MainHook.log("VolumePanelViewController#$methodName (before) called")
                             onVolumePreShowH()
                         }
+
+                        override fun afterHookedMethod(param: MethodHookParam) {
+                            // 每次弹出都刷新应用音量柱的数据（活跃应用会变）
+                            val controller = param.thisObject ?: return
+                            safeHotPath("appVolumeColumn") {
+                                NativeAppVolumeColumn.attach(controller)
+                            }
+                        }
                     })
                 } catch (_: Throwable) {}
+            }
+
+            // 容器（VolumeColumns）在 initPanelView 里才建好，这里补一次插入
+            try {
+                XposedBridge.hookAllMethods(controllerClass, "initPanelView", object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val controller = param.thisObject ?: return
+                        safeHotPath("appVolumeColumnInit") {
+                            NativeAppVolumeColumn.attach(controller)
+                        }
+                    }
+                })
+                MainHook.log("Hooked VolumePanelViewController#initPanelView for app-volume column")
+            } catch (t: Throwable) {
+                MainHook.log("Failed to hook initPanelView", t)
             }
             MainHook.log("Hooked VolumePanelViewController show methods successfully")
         } catch (t: Throwable) {
@@ -1463,7 +1471,7 @@ object SystemUiHooker {
         var p = entryView.parent
         while (p != null) {
             if (p.javaClass.name.contains("MiuiVolumeDialogView")) {
-                (p as? View)?.let { volumeDialogViewRef = WeakReference(it) }
+
                 try {
                     val method = isExpandedMethod?.takeIf { isExpandedMethodOwner == p.javaClass }
                         ?: p.javaClass.getMethod("isExpanded").also {
@@ -1500,11 +1508,8 @@ object SystemUiHooker {
             MainHook.log("updateVisibility: expanded=true -> entry GONE, show app-volume panel")
             divider?.visibility = View.GONE
             entryView.visibility = View.GONE
-            // 只有展开态的面板才够宽放横向滑条；折叠态只有按钮那么宽，塞进去滑块会被挤没
-            showSideColumn()
             return
         }
-        hideSideColumn()
 
         val hasActivePlayback = ActiveAudioDetector.hasActiveMediaPlayback(context)
         tracker.attachContext(context)

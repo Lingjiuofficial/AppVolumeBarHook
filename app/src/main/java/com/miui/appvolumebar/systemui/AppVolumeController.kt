@@ -67,34 +67,39 @@ internal object AppVolumeController {
         return result
     }
 
-    private fun toActiveApp(config: AudioPlaybackConfiguration, pm: PackageManager): ActiveApp? = try {
-        val cls = config.javaClass
+    private fun toActiveApp(config: AudioPlaybackConfiguration, pm: PackageManager): ActiveApp? {
+        return try {
+                val cls = config::class.java
 
-        val uid = invokeInt(cls, config, "getClientUid") ?: return null
-        if (uid < 10000) return null
+            val uid = invokeInt(cls, config, "getClientUid") ?: return null
+            if (uid < 10000) return null
 
-        val state = invokeInt(cls, config, "getPlayerState") ?: 0
-        if (state != PLAYER_STATE_STARTED) return null
+            val state = invokeInt(cls, config, "getPlayerState") ?: 0
+            if (state != PLAYER_STATE_STARTED) return null
 
-        val attrs = config.audioAttributes ?: return null
-        val isMedia = attrs.usage == USAGE_MEDIA || attrs.volumeControlStream == STREAM_MUSIC
-        if (!isMedia) return null
+            val attrs = config.audioAttributes ?: return null
+            val isMedia = attrs.usage == USAGE_MEDIA || attrs.volumeControlStream == STREAM_MUSIC
+            if (!isMedia) return null
 
-        val pkg = pm.getNameForUid(uid) ?: return null
-        if (pkg == "com.miui.miwallpaper") return null
+            val pkg = pm.getNameForUid(uid) ?: return null
+            if (pkg == "com.miui.miwallpaper") return null
 
-        val player = runCatching {
-            cls.getDeclaredMethod("getPlayerProxy").apply { isAccessible = true }.invoke(config)
-        }.getOrNull() ?: return null
+            val player = runCatching {
+                cls.getDeclaredMethod("getPlayerProxy").apply { isAccessible = true }.invoke(config)
+            }.getOrNull() ?: return null
 
-        val appInfo = runCatching { pm.getApplicationInfo(pkg, 0) }.getOrNull()
-        val label = appInfo?.let { runCatching { pm.getApplicationLabel(it).toString() }.getOrNull() }
-            ?: pkg
-        val icon = appInfo?.let { runCatching { pm.getApplicationIcon(it) }.getOrNull() }
+            val appInfo = runCatching { pm.getApplicationInfo(pkg, 0) }.getOrNull()
+            val label: String = appInfo?.let { info ->
+                runCatching { pm.getApplicationLabel(info).toString() }.getOrNull()
+            } ?: pkg
+            val icon: Drawable? = appInfo?.let { info ->
+                runCatching { pm.getApplicationIcon(info) }.getOrNull()
+            }
 
-        ActiveApp(uid, pkg, label, icon, player)
-    } catch (_: Throwable) {
-        null
+                ActiveApp(uid, pkg, label, icon, player)
+        } catch (_: Throwable) {
+            null
+        }
     }
 
     private fun invokeInt(cls: Class<*>, target: Any, name: String): Int? = try {
@@ -113,39 +118,39 @@ internal object AppVolumeController {
         val v = value.coerceIn(0f, 1f)
         rememberVolume(app.packageName, v)
         return try {
-            resolveSetVolume(app.player).invoke(app.player, v)
-            true
-        } catch (t: Throwable) {
-            MainHook.log("AppVolumeController.setAppVolume failed for ${app.packageName}", t)
-            false
-        }
+                resolveSetVolume(app.player).invoke(app.player, v)
+                true
+            } catch (t: Throwable) {
+                MainHook.log("AppVolumeController.setAppVolume failed for ${app.packageName}", t)
+                false
+            }
     }
 
     /** IPlayer 是 aidl 代理，方法声明在接口上，按接口反射最稳。 */
     private fun resolveSetVolume(player: Any): Method {
-        val cached = setVolumeMethod
-        if (cached != null && setVolumeClass == player.javaClass) return cached
+            val cached = setVolumeMethod
+            if (cached != null && setVolumeClass == player.javaClass) return cached
 
-        val method = runCatching {
-            val iface = Class.forName("android.media.IPlayer")
-            iface.getMethod("setVolume", Float::class.javaPrimitiveType)
-        }.getOrElse {
-            // 退路：直接在代理类上找（厂商裁剪时接口可能不可见）
-            var c: Class<*>? = player.javaClass
-            var found: Method? = null
-            while (c != null && found == null) {
-                found = c.declaredMethods.firstOrNull {
-                    it.name == "setVolume" &&
-                        it.parameterTypes.size == 1 &&
-                        it.parameterTypes[0] == Float::class.javaPrimitiveType
+            val method = runCatching {
+                val iface = Class.forName("android.media.IPlayer")
+                iface.getMethod("setVolume", Float::class.javaPrimitiveType)
+            }.getOrElse {
+                // 退路：直接在代理类上找（厂商裁剪时接口可能不可见）
+                var c: Class<*>? = player.javaClass
+                var found: Method? = null
+                while (c != null && found == null) {
+                    found = c.declaredMethods.firstOrNull {
+                        it.name == "setVolume" &&
+                            it.parameterTypes.size == 1 &&
+                            it.parameterTypes[0] == Float::class.javaPrimitiveType
+                    }
+                    c = c.superclass
                 }
-                c = c.superclass
+                found ?: throw NoSuchMethodException("setVolume(float) not found")
             }
-            found ?: throw NoSuchMethodException("setVolume(float) not found")
-        }
-        method.isAccessible = true
-        setVolumeMethod = method
-        setVolumeClass = player.javaClass
-        return method
+            method.isAccessible = true
+            setVolumeMethod = method
+            setVolumeClass = player.javaClass
+            return method
     }
 }
