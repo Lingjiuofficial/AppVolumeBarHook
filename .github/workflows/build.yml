@@ -1,7 +1,5 @@
 name: Build
 
-# 手动触发：Actions → Build → Run workflow
-# 或者在打 tag 时自动构建（v* 触发）
 on:
   workflow_dispatch:
   push:
@@ -19,26 +17,35 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 必须 21：gradle-wrapper 是 9.4.1，且 gradle/gradle-daemon-jvm.properties 里
-      # toolchainVersion=21。用 17 的话 Gradle 会自己去下载 JDK 21，白等几分钟。
+      # 必须 21：gradle-wrapper 是 9.4.1，且 gradle/gradle-daemon-jvm.properties 里 toolchainVersion=21
       - name: Set up JDK 21
         uses: actions/setup-java@v4
         with:
           java-version: '21'
           distribution: temurin
 
-      # 提供 sdkmanager 并接受 license，AGP 才能自动拉 compileSdk 37 的 platform
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
+
+      # runner 本身已带 Android SDK 和 licenses，这里只补 compileSdk 37 的 platform。
+      # 全部容错：装不上也让构建继续，交给 AGP 自己尝试下载，别在环境这步拦死。
+      - name: Ensure Android platform 37
+        run: |
+          SDK="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          echo "SDK=$SDK"
+          ls -d "$SDK"/platforms/* 2>/dev/null || true
+          SDKMGR=$(ls -d "$SDK"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | head -1)
+          echo "sdkmanager=$SDKMGR"
+          if [ -n "$SDKMGR" ]; then
+            yes | "$SDKMGR" --licenses > /dev/null 2>&1 || true
+            "$SDKMGR" --install "platforms;android-37" || true
+          fi
+          echo "--- platforms after ---"
+          ls -d "$SDK"/platforms/* 2>/dev/null || true
 
       - name: Make gradlew executable
         run: chmod +x gradlew
 
-      # 签名：配置了 Secrets 就用你自己的 keystore（可覆盖安装）；
-      # 没配就自动回退 debug 签名（app/build.gradle.kts 内建逻辑，能出包但要先卸载原版）
       - name: Build release APK
         env:
           SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
@@ -51,7 +58,6 @@ jobs:
         run: |
           mkdir -p out
           find app/build/outputs/apk/release -name '*.apk' -exec cp -v {} out/ \;
-          echo '--- result ---'
           ls -lh out/
 
       - name: Show signature
