@@ -63,7 +63,7 @@ object MiSoundHooker {
     private const val CARD_BLUR_DP = 48f
 
     /** ViewRootImpl 就绪存在时序差，attach 早期拿不到时补几次。 */
-    private const val BLUR_RETRY_MAX = 3
+    private const val BLUR_RETRY_MAX = 0
     private const val BLUR_RETRY_DELAY_MS = 80L
 
     private fun blurBehindRadiusPx(context: Context): Int =
@@ -137,9 +137,9 @@ object MiSoundHooker {
                                 // —— 这就是"多音量界面没有玻璃"的根因。
                                 params.flags = params.flags and WindowManager.LayoutParams.FLAG_DIM_BEHIND.inv()
                                 params.dimAmount = 0.0f
-                                params.flags = params.flags or WindowManager.LayoutParams.FLAG_BLUR_BEHIND
+                                params.flags = params.flags and WindowManager.LayoutParams.FLAG_BLUR_BEHIND.inv()
                                 params.javaClass.getMethod("setBlurBehindRadius", Int::class.javaPrimitiveType)
-                                    .invoke(params, blurBehindRadiusPx(view.context))
+                                    .invoke(params, 0)
                             } catch (t: Throwable) {
                                 // 改窗口参数失败绝不能让 misound 崩掉，保持原样即可
                                 MainHook.log("Failed to tune volume panel window blur", t)
@@ -1099,9 +1099,9 @@ object MiSoundHooker {
                 shape = GradientDrawable.RECTANGLE
                 this.cornerRadius = cornerRadius
                 val fallbackColor = if (isNight) {
-                    Color.parseColor("#D01E1E22")
+                    Color.parseColor("#4D1E1E22")
                 } else {
-                    Color.parseColor("#CC454548")
+                    Color.parseColor("#33454A55")
                 }
                 setColor(fallbackColor)
             }
