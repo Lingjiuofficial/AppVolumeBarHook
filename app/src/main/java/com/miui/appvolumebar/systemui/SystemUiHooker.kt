@@ -92,37 +92,22 @@ object SystemUiHooker {
     @Volatile private var isExpandedMethod: Method? = null
     @Volatile private var isExpandedMethodOwner: Class<*>? = null
 
-    /**
-     * 入口按钮的点击兜底：内嵌应用音量列表的就地展开/收起。
-     * 返回 true 表示已处理；返回 false 表示本地没有活跃应用，交回 misound 老路径。
-     */
-    internal var onEntryClicked: (() -> Boolean)? = null
-    private var appVolumePanelRef: WeakReference<LinearLayout>? = null
+    /** 原生音量面板（MiuiVolumeDialogView），独立应用音量柱以它为锚点定位。 */
+    private var volumeDialogViewRef: WeakReference<View>? = null
 
-    private fun toggleAppVolumePanel(): Boolean {
-        return try {
-            val panel = appVolumePanelRef?.get() ?: return false
-            val cl = pluginClassLoader ?: return false
-            if (panel.visibility == View.VISIBLE) {
-                panel.visibility = View.GONE
-                return true
-            }
-            if (!AppVolumePanelView.refresh(panel, cl)) {
-                MainHook.log("toggleAppVolumePanel: no active media app, fallback to misound")
-                return false
-            }
-            panel.visibility = View.VISIBLE
-            panel.alpha = 0f
-            panel.animate().alpha(1f).setDuration(160L).start()
-            true
+    /** 展开态挂上贴在面板左边的独立音量柱；View 在 SystemUI 进程，材质由 HyperLight 接管。 */
+    private fun showSideColumn() {
+        try {
+            val anchor = volumeDialogViewRef?.get() ?: return
+            val cl = pluginClassLoader ?: return
+            SideAppVolumeColumn.attach(anchor, cl)
         } catch (t: Throwable) {
-            MainHook.log("toggleAppVolumePanel failed", t)
-            false
+            MainHook.log("showSideColumn failed", t)
         }
     }
 
-    private fun hideAppVolumePanel() {
-        runCatching { appVolumePanelRef?.get()?.visibility = View.GONE }
+    private fun hideSideColumn() {
+        runCatching { volumeDialogViewRef?.get()?.let { SideAppVolumeColumn.detach(it) } }
     }
     @Volatile private var visibilityUpdateDeferred = false
     private var deferredVisibilityRetries = 0
@@ -1218,21 +1203,6 @@ object SystemUiHooker {
 
         parentGroup.addView(entryView, insertIndex, layoutParams)
         cachedEntryView = WeakReference(entryView)
-
-        // 应用音量列表：紧跟入口按钮插在同一个 LinearLayout 里。
-        // 材质走官方 Util.setMiViewBlurAndBlendColor，HyperLight 会像认领官方控件一样认领它。
-        try {
-            var panel = parentGroup.findViewWithTag<LinearLayout>(AppVolumePanelView.TAG_PANEL_ROOT)
-            if (panel == null) {
-                panel = AppVolumePanelView.create(context)
-                parentGroup.addView(panel, insertIndex + 1)
-            }
-            appVolumePanelRef = WeakReference(panel)
-            onEntryClicked = { toggleAppVolumePanel() }
-            MainHook.log("[$trigger] App-volume panel attached to ${parentGroup.javaClass.simpleName}")
-        } catch (t: Throwable) {
-            MainHook.log("[$trigger] Failed to insert app-volume panel", t)
-        }
         val officialDnd = dndButton
         if (officialDnd != null) {
             cachedDndView = WeakReference(officialDnd)
@@ -1493,6 +1463,7 @@ object SystemUiHooker {
         var p = entryView.parent
         while (p != null) {
             if (p.javaClass.name.contains("MiuiVolumeDialogView")) {
+                (p as? View)?.let { volumeDialogViewRef = WeakReference(it) }
                 try {
                     val method = isExpandedMethod?.takeIf { isExpandedMethodOwner == p.javaClass }
                         ?: p.javaClass.getMethod("isExpanded").also {
@@ -1526,11 +1497,14 @@ object SystemUiHooker {
         // 展开态入口不参与音量条上方的官方静音/勿扰按钮动画，直接隐藏；
         // 且对应的 divider 间隔也要同步隐藏，避免在下方留下空白
         if (realExpanded) {
-            MainHook.log("updateVisibility: expanded=true -> GONE")
+            MainHook.log("updateVisibility: expanded=true -> entry GONE, show app-volume panel")
             divider?.visibility = View.GONE
             entryView.visibility = View.GONE
+            // 只有展开态的面板才够宽放横向滑条；折叠态只有按钮那么宽，塞进去滑块会被挤没
+            showSideColumn()
             return
         }
+        hideSideColumn()
 
         val hasActivePlayback = ActiveAudioDetector.hasActiveMediaPlayback(context)
         tracker.attachContext(context)
