@@ -366,8 +366,21 @@ object VolumeEntryLayout {
         context: Context,
         onDismissRequest: () -> Unit
     ): View.OnClickListener = View.OnClickListener {
-        MainHook.log("Volume entry clicked, triggering misound and dismissing volume dialog")
         SystemUiHooker.tracker.recordInvoke("sysui_entry_injection")
+
+        // 0. 优先就地展开内嵌的应用音量列表：View 在 SystemUI 进程里创建，
+        //    HyperLight 能像对待官方控件一样接管它的玻璃。本地没有活跃应用时返回 false，
+        //    退回 misound 老路径。
+        try {
+            if (SystemUiHooker.onEntryClicked?.invoke() == true) {
+                MainHook.log("Volume entry clicked, expanded inline app-volume panel")
+                return@OnClickListener
+            }
+        } catch (t: Throwable) {
+            MainHook.log("Inline app-volume toggle failed", t)
+        }
+
+        MainHook.log("Volume entry clicked, triggering misound and dismissing volume dialog")
 
         // 1. 优先使用前台广播极速通知 Misound 唤起面板，绕过 Android 后台广播队列调度延迟
         try {

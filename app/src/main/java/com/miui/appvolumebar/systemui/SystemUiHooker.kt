@@ -91,6 +91,39 @@ object SystemUiHooker {
     /** MiuiVolumeDialogView#isExpanded 反射句柄，避免每次重新扫方法表。 */
     @Volatile private var isExpandedMethod: Method? = null
     @Volatile private var isExpandedMethodOwner: Class<*>? = null
+
+    /**
+     * 入口按钮的点击兜底：内嵌应用音量列表的就地展开/收起。
+     * 返回 true 表示已处理；返回 false 表示本地没有活跃应用，交回 misound 老路径。
+     */
+    internal var onEntryClicked: (() -> Boolean)? = null
+    private var appVolumePanelRef: WeakReference<LinearLayout>? = null
+
+    private fun toggleAppVolumePanel(): Boolean {
+        return try {
+            val panel = appVolumePanelRef?.get() ?: return false
+            val cl = pluginClassLoader ?: return false
+            if (panel.visibility == View.VISIBLE) {
+                panel.visibility = View.GONE
+                return true
+            }
+            if (!AppVolumePanelView.refresh(panel, cl)) {
+                MainHook.log("toggleAppVolumePanel: no active media app, fallback to misound")
+                return false
+            }
+            panel.visibility = View.VISIBLE
+            panel.alpha = 0f
+            panel.animate().alpha(1f).setDuration(160L).start()
+            true
+        } catch (t: Throwable) {
+            MainHook.log("toggleAppVolumePanel failed", t)
+            false
+        }
+    }
+
+    private fun hideAppVolumePanel() {
+        runCatching { appVolumePanelRef?.get()?.visibility = View.GONE }
+    }
     @Volatile private var visibilityUpdateDeferred = false
     private var deferredVisibilityRetries = 0
 
@@ -1185,6 +1218,21 @@ object SystemUiHooker {
 
         parentGroup.addView(entryView, insertIndex, layoutParams)
         cachedEntryView = WeakReference(entryView)
+
+        // 应用音量列表：紧跟入口按钮插在同一个 LinearLayout 里。
+        // 材质走官方 Util.setMiViewBlurAndBlendColor，HyperLight 会像认领官方控件一样认领它。
+        try {
+            var panel = parentGroup.findViewWithTag<LinearLayout>(AppVolumePanelView.TAG_PANEL_ROOT)
+            if (panel == null) {
+                panel = AppVolumePanelView.create(context)
+                parentGroup.addView(panel, insertIndex + 1)
+            }
+            appVolumePanelRef = WeakReference(panel)
+            onEntryClicked = { toggleAppVolumePanel() }
+            MainHook.log("[$trigger] App-volume panel attached to ${parentGroup.javaClass.simpleName}")
+        } catch (t: Throwable) {
+            MainHook.log("[$trigger] Failed to insert app-volume panel", t)
+        }
         val officialDnd = dndButton
         if (officialDnd != null) {
             cachedDndView = WeakReference(officialDnd)
@@ -1386,6 +1434,7 @@ object SystemUiHooker {
         val divider = cachedDividerView?.get()
         divider?.visibility = View.GONE
         entry.visibility = View.GONE
+        hideAppVolumePanel()
         entry.translationX = 0f
         entry.translationY = 0f
         entry.scaleX = 1f
