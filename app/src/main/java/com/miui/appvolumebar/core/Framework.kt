@@ -2,18 +2,14 @@ package com.miui.appvolumebar.core
 
 import android.content.Context
 import android.os.Process
+import de.robv.android.xposed.XposedHelpers
 
 /**
- * 三个系统应用的统一接入点。
+ * 三个系统进程的统一接入点。
  *
- * 每个进程进来只做四件事，全部有日志、全部不抛异常：
- *   1. 安全模式检查（命中就立刻退出，不做任何注入）
- *   2. 环境自检（classLoader 对不对、关键类在不在、配置能不能读）
- *   3. 装探针（OBSERVE，只读）
- *   4. 输出安装报告 + 落盘
- *
- * 这份日志本身就是「框架是否正常工作」的证据：哪个类没找到、哪个 hook 没装上，
- * 一眼就能看出来，不用再靠猜。
+ * 关键点（真机自检得出的）：音量面板的类不在 SystemUI 自己的 loader 里，
+ * 而在 miui.systemui.plugin 这个插件包的 loader 里。所以这里先「解析 loader」，
+ * 解析不到就挂 loadPlugin 等它加载完——这是之前所有失败的总根源。
  */
 internal object Framework {
 
@@ -21,24 +17,17 @@ internal object Framework {
     const val PROCESS_PLUGIN = "miui.systemui.plugin"
     const val PROCESS_MISOUND = "com.miui.misound"
 
-    /**
-     * 用来验证「classLoader 拿对了」的标志类。
-     * 找到 = 这个 loader 能看到目标代码；找不到 = loader 不对，后面所有 hook 都会 MISS。
-     */
-    private val sanityClasses = mapOf(
-        PROCESS_SYSTEMUI to listOf(
-            "com.android.systemui.miui.volume.VolumePanelViewController",
-            "com.android.systemui.miui.volume.MiuiVolumeDialogView",
-            "com.android.systemui.miui.volume.VolumeColumn",
-        ),
-        PROCESS_PLUGIN to listOf(
-            "miui.systemui.controlcenter.panel.main.volume.VolumeSliderController",
-            "miui.systemui.controlcenter.panel.secondary.volume.VolumePanelController",
-        ),
-        PROCESS_MISOUND to listOf(
-            "com.miui.misound.MiSoundApplication",
-        ),
+    private const val PLUGIN_INSTANCE_CLASS = "com.android.systemui.shared.plugins.PluginInstance"
+
+    private val volumeClasses = listOf(
+        "com.android.systemui.miui.volume.VolumePanelViewController",
+        "com.android.systemui.miui.volume.MiuiVolumeDialogView",
+        "com.android.systemui.miui.volume.VolumeColumn",
+        "com.android.systemui.miui.volume.MiuiRingerModeLayout",
     )
+
+    @Volatile private var probeInstalled = false
+    @Volatile private var deferHooked = false
 
     fun bootstrap(process: String, cl: ClassLoader, context: Context?) {
         HookKit.log("╔══ AVBH Framework @ $process (pid=${Process.myPid()}) ══")
@@ -46,46 +35,78 @@ internal object Framework {
 
         val reason = SafeMode.check()
         if (reason != null) {
-            HookKit.log("║ ⛔ 安全模式生效：$reason")
-            HookKit.log("║    本进程不做任何注入")
-            val path = HookKit.flushLog(context)
-            HookKit.log("║ 日志: ${path ?: "仅 logcat"}")
+            HookKit.log("║ ⛔ 安全模式生效：$reason，本进程不做任何注入")
+            HookKit.log("║ 日志: ${HookKit.flushLog(context) ?: "仅 logcat"}")
             HookKit.log("╚══")
             return
         }
 
-        selfCheck(process, cl)
+        if (process != PROCESS_SYSTEMUI && process != PROCESS_PLUGIN) {
+            HookKit.log("║ 本进程暂无探针")
+            HookKit.log("║ 日志: ${HookKit.flushLog(context) ?: "仅 logcat"}")
+            HookKit.log("╚══")
+            return
+        }
 
-        when (process) {
-            PROCESS_SYSTEMUI, PROCESS_PLUGIN -> {
-                HookKit.log("║ ── 装载探针（OBSERVE，只读）──")
-                VolumeProbe.install(cl)
-            }
-            else -> HookKit.log("║ 本进程暂无探针")
+        // ── 解析 loader ──
+        val resolved = ClassLoaderResolver.resolve(cl)
+        if (resolved != null) {
+            HookKit.log("║ ✓ 目标类位于 [${resolved.source}] loader")
+            selfCheck(resolved.loader)
+            installProbes(resolved.loader)
+        } else {
+            HookKit.log("║ ✗ 所有已知 loader 都看不到 ${ClassLoaderResolver.MARKER_CLASS}")
+            HookKit.log("║   → 说明插件还没加载，挂 loadPlugin 等它")
+            selfCheck(cl)
+            deferUntilPluginLoaded(cl)
         }
 
         HookKit.report(process)
-        val path = HookKit.flushLog(context)
-        HookKit.log("║ 日志落盘: ${path ?: "失败，只能看 logcat"}")
+        HookKit.log("║ 日志: ${HookKit.flushLog(context) ?: "仅 logcat"}")
         HookKit.log("╚══")
     }
 
-    private fun selfCheck(process: String, cl: ClassLoader) {
-        HookKit.log("║ ── 环境自检 ──")
-        val classes = sanityClasses[process].orEmpty()
-        if (classes.isEmpty()) {
-            HookKit.log("║   (未登记标志类)")
-        }
-        classes.forEach { name ->
-            val ok = runCatching { Class.forName(name, false, cl) }.isSuccess
+    private fun selfCheck(loader: ClassLoader) {
+        HookKit.log("║ ── 自检（loader=${loader.javaClass.simpleName}）──")
+        volumeClasses.forEach { name ->
+            val ok = runCatching { Class.forName(name, false, loader) }.isSuccess
             HookKit.log("║   ${if (ok) "✓" else "✗"} $name")
         }
-
         val prefOk = runCatching {
-            val prefs = de.robv.android.xposed.XSharedPreferences(HookKit.PREFS_PKG, HookKit.PREFS_NAME)
-            prefs.reload()
+            de.robv.android.xposed.XSharedPreferences(HookKit.PREFS_PKG, HookKit.PREFS_NAME).reload()
             true
         }.getOrDefault(false)
-        HookKit.log("║   ${if (prefOk) "✓" else "✗"} 配置可读 (XSharedPreferences)")
+        HookKit.log("║   ${if (prefOk) "✓" else "✗"} 配置可读")
+    }
+
+    private fun installProbes(loader: ClassLoader) {
+        if (probeInstalled) {
+            HookKit.log("║ 探针已装过，跳过")
+            return
+        }
+        probeInstalled = true
+        HookKit.log("║ ── 装载探针（OBSERVE，只读）──")
+        VolumeProbe.install(loader)
+    }
+
+    /**
+     * 插件还没加载时，挂 loadPlugin 等它。
+     * 加载完成后重新解析 loader，拿到就装探针、打报告。
+     */
+    private fun deferUntilPluginLoaded(processLoader: ClassLoader) {
+        if (deferHooked) return
+        deferHooked = true
+        HookKit.hookAll(
+            processLoader, PLUGIN_INSTANCE_CLASS, "loadPlugin",
+            "framework.loadPlugin", HookKit.Mode.OBSERVE
+        ) {
+            if (probeInstalled) return@hookAll
+            val resolved = ClassLoaderResolver.resolve(processLoader) ?: return@hookAll
+            HookKit.log("║ ★ 插件加载完成，目标类出现在 [${resolved.source}] loader")
+            selfCheck(resolved.loader)
+            installProbes(resolved.loader)
+            HookKit.report("plugin(after loadPlugin)")
+            HookKit.flushLog(null)
+        }
     }
 }
