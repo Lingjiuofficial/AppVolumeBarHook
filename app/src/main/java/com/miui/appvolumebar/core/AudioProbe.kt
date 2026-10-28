@@ -54,7 +54,7 @@ internal object AudioProbe {
 
         val setPlayerVolume = methodOf(
             AudioManager::class.java, "setPlayerVolume",
-            AudioPlaybackConfiguration::class.java, Float::class.javaPrimitiveType
+            AudioPlaybackConfiguration::class.java, java.lang.Float.TYPE
         )
         HookKit.log("║   ${mark(setPlayerVolume)} AudioManager.setPlayerVolume(APC, float)")
 
@@ -69,7 +69,7 @@ internal object AudioProbe {
         HookKit.log("║   ${if (playerProxyClass != null) "✓" else "✗"} 类 android.media.PlayerProxy" +
             (playerProxyClass?.let { " (methods=${it.methods.size})" } ?: ""))
         if (playerProxyClass != null) {
-            val setVol = methodOf(playerProxyClass, "setVolume", Float::class.javaPrimitiveType)
+            val setVol = methodOf(playerProxyClass, "setVolume", java.lang.Float.TYPE)
             HookKit.log("║   ${mark(setVol)} PlayerProxy.setVolume(float)")
         }
 
