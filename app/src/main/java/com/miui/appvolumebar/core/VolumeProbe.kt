@@ -34,6 +34,14 @@ internal object VolumeProbe {
             lastController = param.thisObject
             dumpedOnce = true
             HookKit.log("=== initPanelView returned, panel built ===")
+
+            // 拿 controller 自己的 mContext，顺便跑一次音频 API 探测（只读）
+            val ctx = runCatching {
+                de.robv.android.xposed.XposedHelpers
+                    .getObjectField(param.thisObject, "mContext") as? android.content.Context
+            }.getOrNull()
+            AudioProbe.run(ctx)
+
             dumpStructure(param.thisObject)
         }
 
