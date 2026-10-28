@@ -156,6 +156,29 @@ fun MainScreen() {
         ) {
             Spacer(modifier = Modifier.height(12.dp))
 
+            // 0. 安全模式总开关：出问题第一时间点这里，不用卸载
+            val hookPrefs = remember { context.getSharedPreferences("hook_config", Context.MODE_PRIVATE) }
+            var safeModeOn by remember {
+                mutableStateOf(hookPrefs.getString("master_switch", "on") == "off")
+            }
+            SafetySwitchCard(
+                safeModeOn = safeModeOn,
+                onToggle = {
+                    val next = !safeModeOn
+                    hookPrefs.edit()
+                        .putString("master_switch", if (next) "off" else "on")
+                        .apply()
+                    safeModeOn = next
+                    Toast.makeText(
+                        context,
+                        if (next) "已禁用全部注入，重启 SystemUI 生效" else "已恢复注入，重启 SystemUI 生效",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }
+            )
+
+            Spacer(modifier = Modifier.height(16.dp))
+
             // 1. 模块激活状态总览与快速操作卡片
             ModuleActivationCard(
                 isModuleActive = isModuleActive,
