@@ -2,6 +2,7 @@ package com.miui.appvolumebar.core
 
 import android.content.Context
 import android.os.Process
+import android.view.View
 import de.robv.android.xposed.XposedHelpers
 
 /**
@@ -28,6 +29,9 @@ internal object Framework {
 
     @Volatile private var probeInstalled = false
     @Volatile private var deferHooked = false
+
+    /** 全局 View hook 的句柄，拿到 plugin loader 后立刻卸掉。 */
+    @Volatile private var viewHook: Set<de.robv.android.xposed.XC_MethodHook.Unhook>? = null
 
     fun bootstrap(process: String, cl: ClassLoader, context: Context?) {
         HookKit.log("╔══ AVBH Framework @ $process (pid=${Process.myPid()}) ══")
@@ -107,6 +111,45 @@ internal object Framework {
             installProbes(resolved.loader)
             HookKit.report("plugin(after loadPlugin)")
             HookKit.flushLog(null)
+        }
+        // 插件不走 loadPlugin 时，靠 View 生命周期兜底
+        hookViewLifecycleForLoader(processLoader)
+    }
+
+    /**
+     * 最终兜底：hook android.view.View#onAttachedToWindow，等 miui.volume 的 View 出现。
+     *
+     * 为什么可靠：View 的 getClass().getClassLoader() 就是创建它的那个 loader，
+     * 也就是 plugin 的 DexClassLoader。完全不依赖插件加载机制叫什么、走哪条路。
+     *
+     * 性能：只做一次字符串 contains 判断，拿到 loader 后立刻 unhook。
+     */
+    private fun hookViewLifecycleForLoader(processLoader: ClassLoader) {
+        try {
+            val viewClass = Class.forName("android.view.View", false, processLoader)
+            viewHook = de.robv.android.xposed.XposedBridge.hookAllMethods(
+                viewClass, "onAttachedToWindow",
+                object : de.robv.android.xposed.XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        if (probeInstalled) return
+                        val v = param.thisObject as? View ?: return
+                        val cls = v.javaClass
+                        if (!cls.name.contains("miui.volume")) return
+                        val loader = cls.classLoader ?: return
+                        HookKit.log("║ ★ 从 View 拿到 plugin loader: ${cls.name}")
+                        selfCheck(loader)
+                        installProbes(loader)
+                        HookKit.report("plugin(via View)")
+                        HookKit.flushLog(v.context)
+                        // 拿到就卸掉，别让全局 View 回调长期挂着
+                        runCatching { viewHook?.forEach { it.unhook() } }
+                        viewHook = null
+                    }
+                }
+            )
+            HookKit.log("║ 已挂 View 生命周期兜底（等 miui.volume 的 View 出现）")
+        } catch (t: Throwable) {
+            HookKit.log("║ View 生命周期兜底挂载失败: $t")
         }
     }
 }
