@@ -211,6 +211,9 @@ internal object Framework {
                         AudioProbe.run(v.context)
                         dumpVolumeTree(v, loader)
 
+                        // 把应用音量柱插进去（官方 VolumeColumn + 官方布局）
+                        com.miui.appvolumebar.plugin.AppVolumeColumn.install(v, loader)
+
                         HookKit.report("plugin(via View)")
                         HookKit.flushLog(v.context)
                         // 拿到就卸掉，别让全局 View 回调长期挂着
