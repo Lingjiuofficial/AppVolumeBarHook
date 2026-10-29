@@ -56,13 +56,13 @@ internal object AppVolumeColumn {
                 return false
             }
 
-            // 资源必须走 plugin 的 Context，否则 @dimen/miui_volume_column_* 解析不到
-            val pluginCtx = runCatching {
-                ctx.createPackageContext(pkg, Context.CONTEXT_IGNORE_SECURITY)
-            }.getOrNull() ?: ctx
+            // 关键：官方用的是 controller 的 mContext —— 那是 SystemUI 传给插件的
+            // PluginContextWrapper（资源重定向到 plugin）。panelView.context 就是它。
+            // 用 createPackageContext 反而不对：inflate 时 R.layout 解析不到。
+            val hostCtx = panelView.context
 
             val built = VolumeColumnFactory.build(
-                ctx = pluginCtx,
+                ctx = hostCtx,
                 loader = loader,
                 container = expanded,
                 stream = AudioManager.STREAM_MUSIC,   // 拿"媒体音量"那套样式

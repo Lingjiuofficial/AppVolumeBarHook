@@ -26,6 +26,7 @@ import java.lang.reflect.Method
 internal object VolumeColumnFactory {
 
     private const val VOLUME_COLUMN = "com.android.systemui.miui.volume.VolumeColumn"
+    private const val LAYOUT_COLUMN = "miui_volume_dialog_column"
 
     /** 缓存反射句柄。 */
     private var ctor: java.lang.reflect.Constructor<*>? = null
@@ -33,6 +34,16 @@ internal object VolumeColumnFactory {
     private var getView: Method? = null
     private var getSlider: Method? = null
     private var getIcon: Method? = null
+
+    // 手动最小初始化用（绕开 initColumn 里的可疑调用）
+    private var setView: Method? = null
+    private var setStream: Method? = null
+    private var setSlider: Method? = null
+    private var setProgressView: Method? = null
+    private var setProgressViewBg: Method? = null
+    private var setIcon: Method? = null
+    private var setSuperVolume: Method? = null
+    private var setExpanded: Method? = null
 
     private fun ensure(loader: ClassLoader): Boolean {
         if (ctor != null && initColumn != null) return true
@@ -51,6 +62,25 @@ internal object VolumeColumnFactory {
             getView = cls.getMethod("getView")
             getSlider = cls.getMethod("getSlider")
             getIcon = cls.getMethod("getIcon")
+
+            setView = cls.getMethod("setView", View::class.java)
+            setStream = cls.getMethod("setStream", Int::class.javaPrimitiveType)
+            setSlider = cls.getMethod("setSlider", android.widget.SeekBar::class.java)
+            setExpanded = cls.getMethod("setExpanded", Boolean::class.javaPrimitiveType)
+            setProgressView = runCatching {
+                cls.getMethod("setProgressView", Class.forName(
+                    "com.android.systemui.miui.volume.MiuiVolumeSeekBarProgressView", false, loader))
+            }.getOrNull()
+            setProgressViewBg = runCatching {
+                cls.getMethod("setProgressViewBg", Class.forName(
+                    "com.android.systemui.miui.volume.RoundRectFrameLayout", false, loader))
+            }.getOrNull()
+            setIcon = runCatching {
+                cls.getMethod("setIcon", android.widget.ImageView::class.java)
+            }.getOrNull()
+            setSuperVolume = runCatching {
+                cls.getMethod("setSuperVolume", android.widget.TextView::class.java)
+            }.getOrNull()
             true
         } catch (t: Throwable) {
             HookKit.log("VolumeColumnFactory: 反射准备失败 $t")
@@ -70,6 +100,74 @@ internal object VolumeColumnFactory {
      *                  它不进 mColumns，所以 controller 不会来改它的值。
      * @param expanded  当前是否展开态（影响内部尺寸/圆角选择）
      */
+    /**
+     * 手动最小初始化：只做「让柱子能显示、能被拖动」的必要步骤，
+     * 跳过 initColumn 里所有可能抛异常的可选初始化：
+     *   getSuperVolume().setText(VolumeUtils.getSuperVolumePercent(...))
+     *   setSliderTintColorList(...)
+     *   updateIconColor()      ← 内部用 MiBlurCompat
+     *   sharedSliderRatio()    ← 启动协程
+     */
+    private fun manualBuild(
+        ctx: Context, loader: ClassLoader, container: ViewGroup,
+        stream: Int, expanded: Boolean,
+    ): BuiltColumn? {
+        return try {
+            val column = ctor!!.newInstance()
+            val res = ctx.resources
+            val pkg = ctx.packageName
+            val layoutId = res.getIdentifier(LAYOUT_COLUMN, "layout", pkg)
+            if (layoutId == 0) {
+                HookKit.log("manualBuild: layout id 找不到")
+                return null
+            }
+            val view = android.view.LayoutInflater.from(ctx)
+                .inflate(layoutId, container, false)
+                ?: run {
+                    HookKit.log("manualBuild: inflate 返回 null（资源 id 与 Context 不匹配）")
+                    return null
+                }
+
+            setExpanded?.invoke(column, expanded)
+            setView?.invoke(column, view)
+            setStream?.invoke(column, stream)
+            view.id = stream
+            view.tag = column
+
+            val slider = view.findViewById<android.widget.SeekBar>(
+                res.getIdentifier("volume_column_slider", "id", pkg)
+            )
+            val icon = view.findViewById<android.widget.ImageView>(
+                res.getIdentifier("volume_column_icon", "id", pkg)
+            )
+            val progress = view.findViewById<View>(
+                res.getIdentifier("volume_progress_view", "id", pkg)
+            )
+            val progressBg = view.findViewById<View>(
+                res.getIdentifier("volume_column_view", "id", pkg)
+            )
+            val superVolume = view.findViewById<android.widget.TextView>(
+                res.getIdentifier("miui_super_volume_expanded", "id", pkg)
+            )
+
+            if (slider != null) setSlider?.invoke(column, slider)
+            if (icon != null) setIcon?.invoke(column, icon)
+            if (progress != null && setProgressView != null) {
+                runCatching { setProgressView!!.invoke(column, progress) }
+            }
+            if (progressBg != null && setProgressViewBg != null) {
+                runCatching { setProgressViewBg!!.invoke(column, progressBg) }
+            }
+            if (superVolume != null) setSuperVolume?.invoke(column, superVolume)
+
+            HookKit.log("manualBuild: 成功 slider=${slider != null} icon=${icon != null}")
+            BuiltColumn(column, view, slider, icon)
+        } catch (t: Throwable) {
+            HookKit.log("manualBuild 失败: ${t.javaClass.name}: ${t.message}")
+            null
+        }
+    }
+
     fun build(
         ctx: Context,
         loader: ClassLoader,
@@ -92,8 +190,11 @@ internal object VolumeColumnFactory {
             HookKit.log("VolumeColumnFactory: 造柱成功 view=${view.javaClass.simpleName} slider=$slider")
             BuiltColumn(column, view, slider, icon)
         } catch (t: Throwable) {
-            HookKit.log("VolumeColumnFactory.build 失败: $t")
-            null
+            val cause = (t as? java.lang.reflect.InvocationTargetException)?.cause ?: t
+            HookKit.log("VolumeColumnFactory.initColumn 失败: ${cause.javaClass.name}: ${cause.message}")
+            HookKit.log(android.util.Log.getStackTraceString(cause).lineSequence().take(8).joinToString("\n"))
+            HookKit.log("VolumeColumnFactory: 降级到手动最小初始化")
+            manualBuild(ctx, loader, container, stream, expanded)
         }
     }
 }
