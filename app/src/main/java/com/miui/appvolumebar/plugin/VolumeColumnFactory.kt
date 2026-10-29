@@ -128,7 +128,8 @@ internal object VolumeColumnFactory {
                     return null
                 }
 
-            setExpanded?.invoke(column, expanded)
+            // 顺序关键：setExpanded 会触发 observable.afterChange → updateIconColor → getIcon()，
+            // 而 icon 是 lateinit。所以必须先把子 view 全部塞进去，最后才设 expanded。
             setView?.invoke(column, view)
             setStream?.invoke(column, stream)
             view.id = stream
@@ -160,10 +161,16 @@ internal object VolumeColumnFactory {
             }
             if (superVolume != null) setSuperVolume?.invoke(column, superVolume)
 
+            // 现在 icon 已就绪，才可以动 expanded
+            runCatching { setExpanded?.invoke(column, expanded) }
+                .onFailure { HookKit.log("manualBuild: setExpanded 失败(可忽略) $it") }
+
             HookKit.log("manualBuild: 成功 slider=${slider != null} icon=${icon != null}")
             BuiltColumn(column, view, slider, icon)
         } catch (t: Throwable) {
-            HookKit.log("manualBuild 失败: ${t.javaClass.name}: ${t.message}")
+            val cause = (t as? java.lang.reflect.InvocationTargetException)?.cause ?: t
+            HookKit.log("manualBuild 失败: ${cause.javaClass.name}: ${cause.message}")
+            HookKit.log(android.util.Log.getStackTraceString(cause).lineSequence().take(6).joinToString("\n"))
             null
         }
     }
@@ -178,13 +185,22 @@ internal object VolumeColumnFactory {
         if (!ensure(loader)) return null
         return try {
             val column = ctor!!.newInstance()
+            // 传 false：匹配 isExpanded 的初始值，避免 initColumn 内部 setExpanded 触发
+            // observable → updateIconColor → getIcon() 的 lateinit 崩溃
             initColumn!!.invoke(
                 column, ctx, container, stream,
                 false,   // important
                 false,   // needShowDialog
-                expanded
+                false    // expanded ← 先不展开
             )
             val view = getView!!.invoke(column) as? View ?: return null
+
+            // 此时 icon 已初始化，可以安全切到目标展开态
+            if (expanded) {
+                runCatching { setExpanded?.invoke(column, true) }
+                    .onFailure { HookKit.log("build: 补 setExpanded(true) 失败 ${it.cause ?: it}") }
+            }
+
             val slider = runCatching { getSlider!!.invoke(column) as? android.widget.SeekBar }.getOrNull()
             val icon = runCatching { getIcon!!.invoke(column) as? android.widget.ImageView }.getOrNull()
             HookKit.log("VolumeColumnFactory: 造柱成功 view=${view.javaClass.simpleName} slider=$slider")
