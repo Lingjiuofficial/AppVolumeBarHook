@@ -117,6 +117,65 @@ internal object Framework {
     }
 
     /**
+     * 从 View 树里直接找容器，不经过 controller。
+     *
+     * VolumePanelView（attach 的那个）是整个面板的根，树里有：
+     *   MiuiVolumeDialogView（id=volume_dialog）
+     *     └─ FrameLayout(volume_dialog_content)
+     *         ├─ LinearLayout(gid=volume_dialog_columns)      ← 展开态容器，加柱子用这个
+     *         └─ FrameLayout(volume_dialog_column_collapsed)  ← 折叠态容器
+     *         └─ ImageButton(volume_expand_button)
+     */
+    private fun dumpVolumeTree(anchor: View, loader: ClassLoader) {
+        try {
+            val ctx = anchor.context
+            val pkg = ctx.packageName
+            fun id(name: String): Int =
+                ctx.resources.getIdentifier(name, "id", pkg)
+
+            val root = anchor.rootView ?: anchor
+            HookKit.log("║ ── View 树探测（根=${root.javaClass.simpleName}, 包=$pkg）──")
+
+            listOf(
+                "volume_dialog" to "MiuiVolumeDialogView",
+                "volume_dialog_columns" to "展开态容器",
+                "volume_dialog_column_collapsed" to "折叠态容器",
+                "volume_dialog_column_temp" to "临时容器",
+                "miui_volume_ringer_layout" to "按钮列",
+            ).forEach { (idName, label) ->
+                val rid = id(idName)
+                if (rid == 0) {
+                    HookKit.log("║   ✗ $idName : 资源 id 找不到")
+                    return@forEach
+                }
+                val found = root.findViewById<View>(rid)
+                if (found == null) {
+                    HookKit.log("║   ✗ $idName : 视图不存在")
+                } else {
+                    val vg = found as? android.view.ViewGroup
+                    HookKit.log(
+                        "║   ✓ $idName ($label) = ${found.javaClass.simpleName} " +
+                            "children=${vg?.childCount ?: "-"} size=${found.width}x${found.height}"
+                    )
+                    if (idName == "volume_dialog_columns" && vg != null) {
+                        for (i in 0 until vg.childCount) {
+                            val c = vg.getChildAt(i) ?: continue
+                            HookKit.log(
+                                "║       child[$i] ${c.javaClass.simpleName} " +
+                                    "tag=${c.tag?.javaClass?.simpleName ?: "null"} " +
+                                    "lp=${c.layoutParams?.width}x${c.layoutParams?.height} " +
+                                    "size=${c.width}x${c.height}"
+                            )
+                        }
+                    }
+                }
+            }
+        } catch (t: Throwable) {
+            HookKit.log("║ View 树探测失败: $t")
+        }
+    }
+
+    /**
      * 最终兜底：hook android.view.View#onAttachedToWindow，等 miui.volume 的 View 出现。
      *
      * 为什么可靠：View 的 getClass().getClassLoader() 就是创建它的那个 loader，
@@ -139,6 +198,12 @@ internal object Framework {
                         HookKit.log("║ ★ 从 View 拿到 plugin loader: ${cls.name}")
                         selfCheck(loader)
                         installProbes(loader)
+
+                        // ★ 关键：View 已经 attach，说明面板树已经建好。
+                        // 不依赖任何 controller 方法回调，直接跑探测 + dump 树。
+                        AudioProbe.run(v.context)
+                        dumpVolumeTree(v, loader)
+
                         HookKit.report("plugin(via View)")
                         HookKit.flushLog(v.context)
                         // 拿到就卸掉，别让全局 View 回调长期挂着
