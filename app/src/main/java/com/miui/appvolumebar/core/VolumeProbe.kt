@@ -26,6 +26,9 @@ internal object VolumeProbe {
     @Volatile
     private var lastController: Any? = null
 
+    @Volatile
+    private var probeRuns = 0
+
     fun install(cl: ClassLoader) {
         HookKit.hookAll(
             cl, "$PKG.VolumePanelViewController", "initPanelView",
@@ -35,13 +38,11 @@ internal object VolumeProbe {
             dumpedOnce = true
             HookKit.log("=== initPanelView returned, panel built ===")
 
-            // 拿 controller 自己的 mContext，顺便跑一次音频 API 探测（只读）
             val ctx = runCatching {
                 de.robv.android.xposed.XposedHelpers
                     .getObjectField(param.thisObject, "mContext") as? android.content.Context
             }.getOrNull()
             AudioProbe.run(ctx)
-
             dumpStructure(param.thisObject)
         }
 
@@ -49,7 +50,20 @@ internal object VolumeProbe {
             cl, "$PKG.VolumePanelViewController", "showVolumePanelH",
             "probe.showVolumePanelH", HookKit.Mode.OBSERVE
         ) { param ->
-            HookKit.log("showVolumePanelH args=${param.args?.joinToString(",")}")
+            // 这个方法是每次弹出面板都调用的，比 initPanelView（一辈子一次）可靠得多
+            if (probeRuns >= 2) return@hookAll
+            HookKit.log("=== showVolumePanelH, 第 ${probeRuns + 1} 次探测 ===")
+            HookKit.log("args=${param.args?.joinToString(",")}")
+
+            val ctx = runCatching {
+                de.robv.android.xposed.XposedHelpers
+                    .getObjectField(param.thisObject, "mContext") as? android.content.Context
+            }.getOrNull()
+            AudioProbe.run(ctx)
+            dumpStructure(param.thisObject)
+
+            probeRuns++
+            if (probeRuns == 2) HookKit.log("探测已跑满 2 次，后续不再打印")
         }
 
         HookKit.hookAll(
