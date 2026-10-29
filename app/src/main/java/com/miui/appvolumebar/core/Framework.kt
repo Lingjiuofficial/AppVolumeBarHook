@@ -157,14 +157,21 @@ internal object Framework {
                         "║   ✓ $idName ($label) = ${found.javaClass.simpleName} " +
                             "children=${vg?.childCount ?: "-"} size=${found.width}x${found.height}"
                     )
-                    if (idName == "volume_dialog_columns" && vg != null) {
+                    if (vg != null && (idName == "volume_dialog_columns" ||
+                                idName == "volume_dialog_column_collapsed")) {
                         for (i in 0 until vg.childCount) {
                             val c = vg.getChildAt(i) ?: continue
+                            val tagCls = c.tag?.javaClass?.simpleName ?: "null"
+                            val stream = runCatching {
+                                c.tag?.let {
+                                    it.javaClass.getMethod("getStream").invoke(it) as? Int
+                                }
+                            }.getOrNull()
                             HookKit.log(
                                 "║       child[$i] ${c.javaClass.simpleName} " +
-                                    "tag=${c.tag?.javaClass?.simpleName ?: "null"} " +
-                                    "lp=${c.layoutParams?.width}x${c.layoutParams?.height} " +
-                                    "size=${c.width}x${c.height}"
+                                    "id=${c.id} tag=$tagCls stream=$stream " +
+                                    "vis=${c.visibility} " +
+                                    "lp=${c.layoutParams?.width}x${c.layoutParams?.height}"
                             )
                         }
                     }
